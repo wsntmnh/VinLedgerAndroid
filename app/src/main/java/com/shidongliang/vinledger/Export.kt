@@ -17,6 +17,7 @@ enum class ExportRange(val label: String) {
     TODAY("今天"),
     WEEK("近 7 天"),
     MONTH("近 30 天"),
+    DAY("指定日期"),
     ALL("全部")
 }
 
@@ -50,24 +51,42 @@ private fun startOfToday(): Long {
     return cal.timeInMillis
 }
 
+private fun startOfDay(time: Long): Long {
+    val cal = Calendar.getInstance().apply { timeInMillis = time }
+    cal.set(Calendar.HOUR_OF_DAY, 0)
+    cal.set(Calendar.MINUTE, 0)
+    cal.set(Calendar.SECOND, 0)
+    cal.set(Calendar.MILLISECOND, 0)
+    return cal.timeInMillis
+}
+
 fun filterRecords(
     list: List<ScanRecord>,
     range: ExportRange,
     dir: DirFilter,
     vinOnly: Boolean,
     prefix: String,
-    keyword: String
+    keyword: String,
+    selectedDay: Long? = null
 ): List<ScanRecord> {
     val now = System.currentTimeMillis()
+    val dayStart = startOfToday()
+    var end: Long? = null
     val start: Long = when (range) {
-        ExportRange.TODAY -> startOfToday()
+        ExportRange.TODAY -> dayStart
         ExportRange.WEEK -> now - 7L * 24 * 3600 * 1000
         ExportRange.MONTH -> now - 30L * 24 * 3600 * 1000
+        ExportRange.DAY -> {
+            val base = startOfDay(selectedDay ?: now)
+            end = base + 24L * 3600 * 1000
+            base
+        }
         ExportRange.ALL -> 0L
     }
     val key = keyword.trim().lowercase(Locale.CHINA)
     return list.filter { r ->
         if (r.timestamp < start) return@filter false
+        end?.let { if (r.timestamp >= it) return@filter false }
         when (dir) {
             DirFilter.IN -> if (r.direction != Direction.IN) return@filter false
             DirFilter.OUT -> if (r.direction != Direction.OUT) return@filter false
@@ -126,7 +145,10 @@ fun buildExport(records: List<ScanRecord>, format: ExportFormat, options: Export
             append(header.map(::csvField).joinToString(","))
             append('\n')
             rows.forEach { append(it.map(::csvField).joinToString(",")); append('\n') }
-            append("合计,${records.size} 条")
+            // 合计行补齐空列，避免 Excel 打开时整行坍在第一列
+            val totalRow = mutableListOf("合计", "${records.size} 条")
+            while (totalRow.size < header.size) totalRow.add("")
+            append(totalRow.map(::csvField).joinToString(","))
         }
 
         ExportFormat.TXT -> buildString {
@@ -160,15 +182,22 @@ fun copyToClipboard(context: Context, text: String) {
 }
 
 /** 写到缓存目录并调起系统分享（微信 / 文件 / 邮件都行） */
-fun shareText(context: Context, text: String, fileName: String) {
+fun shareText(context: Context, text: String, fileName: String, format: ExportFormat) {
     val dir = File(context.cacheDir, "exports")
     if (!dir.exists()) dir.mkdirs()
     val file = File(dir, fileName)
     file.writeText(text)
     val uri = FileProvider.getUriForFile(context, "${context.packageName}.fileprovider", file)
+    val mime = when (format) {
+        ExportFormat.TXT -> "text/plain"
+        ExportFormat.CSV -> "text/csv"
+        ExportFormat.JSON -> "application/json"
+    }
     val intent = Intent(Intent.ACTION_SEND).apply {
-        type = "text/plain"
+        type = mime
         putExtra(Intent.EXTRA_STREAM, uri)
+        // 微信等对 EXTRA_STREAM + 纯文本支持差，再塞一份正文本兜底
+        putExtra(Intent.EXTRA_TEXT, text)
         putExtra(Intent.EXTRA_SUBJECT, fileName)
         addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION)
     }
@@ -194,7 +223,6 @@ fun importCsv(text: String): Int {
         val cells = parseCsvLine(line)
         val content = cells.getOrNull(vinIndex)?.trim().orEmpty()
         if (content.isEmpty()) return@forEach
-        if (Store.hasAny(content)) return@forEach
         val direction = cells.getOrNull(dirIndex)?.let {
             when {
                 it.contains("入库") -> Direction.IN
@@ -202,6 +230,9 @@ fun importCsv(text: String): Int {
                 else -> null
             }
         }
+        // 同车架号的入库、出库是两条独立记录，只有内容 + 方向都相同才算重复
+        val duplicated = if (direction != null) Store.hasSame(content, direction, null) else Store.hasAny(content)
+        if (duplicated) return@forEach
         val timestamp = cells.getOrNull(timeIndex)?.let {
             runCatching { formatter.parse(it.trim())?.time }.getOrNull()
         } ?: System.currentTimeMillis()
