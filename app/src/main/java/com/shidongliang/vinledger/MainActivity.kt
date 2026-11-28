@@ -201,8 +201,9 @@ fun ScanScreen(onChanged: () -> Unit) {
         if (uris.isEmpty()) return@rememberLauncherForActivityResult
         scanning = false
         scope.launch {
-            val added = withContext(Dispatchers.IO) { scanAlbum(context, uris) }
+            val (added, last) = withContext(Dispatchers.IO) { scanAlbum(context, uris) }
             scanning = true
+            if (last != null) copyToClipboard(context, last)
             if (added > 0) {
                 onChanged()
                 Toast.makeText(context, "相册识别到 $added 条，已存入记录（方向可在记录页补）", Toast.LENGTH_LONG).show()
@@ -256,6 +257,7 @@ fun ScanScreen(onChanged: () -> Unit) {
                     return@CameraPreview
                 }
                 val record = Store.add(normalized, "相机", format, null)
+                copyToClipboard(context, normalized)
                 scanning = false
                 pending = PendingScan(record.id, normalized)
                 lastVin = normalized
@@ -341,10 +343,11 @@ fun ScanScreen(onChanged: () -> Unit) {
 
 }
 
-/** 相册批量识别，返回新增条数 */
-private fun scanAlbum(context: Context, uris: List<android.net.Uri>): Int {
+/** 相册批量识别，返回（新增条数, 最后一条车架号） */
+private fun scanAlbum(context: Context, uris: List<android.net.Uri>): Pair<Int, String?> {
     val scanner = BarcodeScanning.getClient()
     var added = 0
+    var last: String? = null
     uris.forEach { uri ->
         val bitmap = runCatching {
             context.contentResolver.openInputStream(uri)?.use { BitmapFactory.decodeStream(it) }
@@ -365,9 +368,10 @@ private fun scanAlbum(context: Context, uris: List<android.net.Uri>): Int {
         val normalized = VinUtil.vinFrom(hit.rawValue.orEmpty()) ?: hit.rawValue.orEmpty()
         if (normalized.isBlank() || Store.hasAny(normalized)) return@forEach
         Store.add(normalized, "相册", BarcodeAnalyzer.formatName(hit.format), null)
+        last = normalized
         added++
     }
-    return added
+    return added to last
 }
 
 private fun finishPending(
