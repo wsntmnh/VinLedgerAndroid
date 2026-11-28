@@ -1,5 +1,6 @@
 package com.shidongliang.vinledger
 
+import android.graphics.Bitmap
 import android.graphics.Color as AndroidColor
 import android.graphics.Rect
 import androidx.camera.core.ImageAnalysis
@@ -51,41 +52,66 @@ class BarcodeAnalyzer(
             image.close()
             return
         }
-        val media = image.image
-        if (media == null) {
-            image.close()
-            return
-        }
         busy = true
-        val input = InputImage.fromMediaImage(media, image.imageInfo.rotationDegrees)
-        runCatching {
+        val rotation = image.imageInfo.rotationDegrees
+        var full: Bitmap? = null
+        var crop: Bitmap? = null
+        try {
+            full = image.toBitmap()
+            var target: Bitmap = full
             val f = roiFraction()
-            if (f.size == 4) {
-                val w = media.width
-                val h = media.height
-                input.cropRect = Rect(
-                    (f[0] * w).toInt().coerceIn(0, w - 1),
-                    (f[1] * h).toInt().coerceIn(0, h - 1),
-                    (f[2] * w).toInt().coerceIn(1, w),
-                    (f[3] * h).toInt().coerceIn(1, h)
-                )
+            if (f.size == 4 && full.width > 160 && full.height > 160) {
+                val w = full.width
+                val h = full.height
+                // 取景框比例是竖屏显示坐标，旋转 90/270 时需折算到图像自身坐标
+                val dx0 = f[0]
+                val dy0 = f[1]
+                val dx1 = f[2]
+                val dy1 = f[3]
+                val rect = when (rotation) {
+                    90 -> Rect(
+                        ((1f - dy1) * w).toInt(), (dx0 * h).toInt(),
+                        ((1f - dy0) * w).toInt(), (dx1 * h).toInt()
+                    )
+                    270 -> Rect(
+                        (dy0 * w).toInt(), ((1f - dx1) * h).toInt(),
+                        (dy1 * w).toInt(), ((1f - dx0) * h).toInt()
+                    )
+                    else -> Rect(
+                        (dx0 * w).toInt(), (dy0 * h).toInt(),
+                        (dx1 * w).toInt(), (dy1 * h).toInt()
+                    )
+                }
+                val l = rect.left.coerceIn(0, w - 96)
+                val t = rect.top.coerceIn(0, h - 96)
+                val r = rect.right.coerceIn(l + 96, w)
+                val b = rect.bottom.coerceIn(t + 96, h)
+                crop = Bitmap.createBitmap(full, l, t, r - l, b - t)
+                target = crop
             }
-        }
-        scanner.process(input)
-            .addOnSuccessListener { list ->
-                val hit = list.firstOrNull { !it.rawValue.isNullOrEmpty() }
-                if (hit != null) {
-                    val now = System.currentTimeMillis()
-                    if (now - lastAt >= 1200) {
-                        lastAt = now
-                        onResult(hit.rawValue.orEmpty(), formatName(hit.format))
+            scanner.process(InputImage.fromBitmap(target, rotation))
+                .addOnSuccessListener { list ->
+                    val hit = list.firstOrNull { !it.rawValue.isNullOrEmpty() }
+                    if (hit != null) {
+                        val now = System.currentTimeMillis()
+                        if (now - lastAt >= 1200) {
+                            lastAt = now
+                            onResult(hit.rawValue.orEmpty(), formatName(hit.format))
+                        }
                     }
                 }
-            }
-            .addOnCompleteListener {
-                image.close()
-                busy = false
-            }
+                .addOnCompleteListener {
+                    image.close()
+                    if (crop !== full) runCatching { crop?.recycle() }
+                    runCatching { full?.recycle() }
+                    busy = false
+                }
+        } catch (t: Throwable) {
+            runCatching { crop?.recycle() }
+            runCatching { full?.recycle() }
+            runCatching { image.close() }
+            busy = false
+        }
     }
 
     companion object {
